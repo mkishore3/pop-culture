@@ -14,6 +14,8 @@ function App() {
   const [referencePoses, setReferencePoses] = useState([]);
   const [userPoses, setUserPoses] = useState([]);
   const [isRecording, setIsRecording] = useState(false);
+  const [countdown, setCountdown] = useState(null);
+  const [isReady, setIsReady] = useState(false);
 
   const onResults = useCallback((results) => {
     if (!canvasRef.current) return;
@@ -162,29 +164,22 @@ function App() {
     let magnitude1 = 0;
     let magnitude2 = 0;
 
-    // Calculate dot product and magnitudes for each landmark
     for (let i = 0; i < vec1.length; i++) {
       if (vec1[i] && vec2[i]) {
-        // Calculate the dot product
         dotProduct += vec1[i].x * vec2[i].x + vec1[i].y * vec2[i].y;
-        
-        // Calculate magnitudes
-        magnitude1 += Math.sqrt(vec1[i].x * vec1[i].x + vec1[i].y * vec1[i].y);
-        magnitude2 += Math.sqrt(vec2[i].x * vec2[i].x + vec2[i].y * vec2[i].y);
+        magnitude1 += vec1[i].x * vec1[i].x + vec1[i].y * vec1[i].y;
+        magnitude2 += vec2[i].x * vec2[i].x + vec2[i].y * vec2[i].y;
       }
     }
 
-    // Calculate average magnitudes
-    magnitude1 = magnitude1 / vec1.length;
-    magnitude2 = magnitude2 / vec2.length;
+    magnitude1 = Math.sqrt(magnitude1);
+    magnitude2 = Math.sqrt(magnitude2);
 
     if (magnitude1 === 0 || magnitude2 === 0) return 0;
     
-    // Calculate the cosine similarity
-    const similarity = dotProduct / (magnitude1 * magnitude2);
-    
-    // Convert from [-1, 1] to [0, 1] and scale to make differences more noticeable
-    return Math.max(0, (similarity + 1) / 2);
+    // Convert cosine similarity from [-1, 1] to [0, 1] and add 50
+    const similarity = (dotProduct / (magnitude1 * magnitude2) + 1) / 2;
+    return (similarity * 50) + 50;
   };
 
   const calculateSimilarity = () => {
@@ -222,9 +217,7 @@ function App() {
       }
     }
 
-    // Calculate final score with more variation
-    const averageSimilarity = count > 0 ? totalSimilarity / count : 0;
-    return averageSimilarity * 100;
+    return count > 0 ? (totalSimilarity / count) : 0;
   };
 
   const handleVideoEnd = () => {
@@ -236,13 +229,20 @@ function App() {
     setUserPoses([]);
   };
 
-  const togglePlayPause = () => {
-    if (referenceVideoRef.current) {
-      if (isPlaying) {
-        referenceVideoRef.current.pause();
-        setIsPlaying(false);
-        setIsRecording(false);
-      } else {
+  const startCountdown = () => {
+    setCountdown(3);
+    setIsReady(true);
+  };
+
+  useEffect(() => {
+    let timer;
+    if (countdown > 0) {
+      timer = setTimeout(() => {
+        setCountdown(countdown - 1);
+      }, 1000);
+    } else if (countdown === 0) {
+      // Start the video when countdown reaches 0
+      if (referenceVideoRef.current) {
         referenceVideoRef.current.play();
         setIsPlaying(true);
         setIsRecording(true);
@@ -250,15 +250,33 @@ function App() {
         setReferencePoses([]);
         setUserPoses([]);
       }
+      setCountdown(null);
+    }
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
+  }, [countdown]);
+
+  const togglePlayPause = () => {
+    if (referenceVideoRef.current) {
+      if (isPlaying) {
+        referenceVideoRef.current.pause();
+        setIsPlaying(false);
+        setIsRecording(false);
+        setIsReady(false);
+      } else {
+        startCountdown();
+      }
     }
   };
 
   const restartVideo = () => {
     if (referenceVideoRef.current) {
       referenceVideoRef.current.currentTime = 0;
-      referenceVideoRef.current.play();
-      setIsPlaying(true);
-      setIsRecording(true);
+      setIsPlaying(false);
+      setIsRecording(false);
+      setIsReady(false);
+      setCountdown(null);
       // Clear all stored data
       setSimilarityScore(null);
       setReferencePoses([]);
@@ -315,6 +333,17 @@ function App() {
           display: "inline-block"
         }}>
           Similarity Score: {similarityScore.toFixed(2)}%
+        </div>
+      )}
+      {countdown !== null && (
+        <div style={{
+          fontSize: "72px",
+          margin: "20px",
+          padding: "15px",
+          color: "#4CAF50",
+          fontWeight: "bold"
+        }}>
+          {countdown}
         </div>
       )}
       <div style={{ 
@@ -376,13 +405,13 @@ function App() {
                   padding: "8px 16px",
                   borderRadius: "20px",
                   border: "none",
-                  backgroundColor: "#4CAF50",
+                  backgroundColor: isReady ? "#FF5722" : "#4CAF50",
                   color: "white",
                   cursor: "pointer",
                   fontSize: "16px"
                 }}
               >
-                {isPlaying ? "Pause" : "Play"}
+                {isReady ? "Cancel" : (isPlaying ? "Pause" : "Start")}
               </button>
               <button
                 onClick={restartVideo}
