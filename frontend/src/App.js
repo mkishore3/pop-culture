@@ -1,21 +1,24 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
+import { db, auth, functions } from './firebase';
+import { doc, setDoc, getDoc, onSnapshot, updateDoc } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
 
 function App() {
   const [gameState, setGameState] = useState('lobby'); // 'lobby', 'waiting', 'playing', 'results'
   const [roomId, setRoomId] = useState('');
   const [playerId, setPlayerId] = useState('');
-  const [playerNumber, setPlayerNumber] = useState(null);
-  const [opponentScore, setOpponentScore] = useState(0);
+  const [isHost, setIsHost] = useState(false);
   const [gameResults, setGameResults] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const referenceVideoRef = useRef(null);
   const referenceCanvasRef = useRef(null);
-  const opponentCanvasRef = useRef(null);
+  const remoteVideoRef = useRef(null);
   const poseRef = useRef(null);
   const referencePoseRef = useRef(null);
-  const opponentPoseRef = useRef(null);
+  const pcRef = useRef(null);
   const [isReferenceVideoReady, setIsReferenceVideoReady] = useState(false);
   const [isWebcamReady, setIsWebcamReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -26,6 +29,15 @@ function App() {
   const scoreHistoryRef = useRef([]);
   const [showFinalScore, setShowFinalScore] = useState(false);
   const wsRef = useRef(null);
+
+  // Firebase Functions
+  const createRoomFunction = httpsCallable(functions, 'createRoom');
+  const joinRoomFunction = httpsCallable(functions, 'joinRoom');
+  const startGameFunction = httpsCallable(functions, 'startGame');
+  const submitScoreFunction = httpsCallable(functions, 'submitScore');
+  const handleOfferFunction = httpsCallable(functions, 'handleOffer');
+  const handleAnswerFunction = httpsCallable(functions, 'handleAnswer');
+  const handleIceCandidateFunction = httpsCallable(functions, 'handleIceCandidate');
 
   const calculateAverageScore = (scores) => {
     if (!scores || scores.length === 0) return 0;
@@ -204,12 +216,15 @@ function App() {
     return 0;
   };
 
-  const handleVideoEnd = () => {
+  const handleVideoEnd = async () => {
     setIsPlaying(false);
     setIsVideoEnded(true);
     const score = calculateSimilarity();
     setSimilarityScore(score);
     referencePoseRef.current.lastResults = null;
+    
+    // Submit score
+    await submitScore(score);
   };
 
   const startCountdown = () => {
@@ -294,32 +309,146 @@ function App() {
     };
   }, [isWebcamReady, isReferenceVideoReady, isPlaying]);
 
+  // WebRTC configuration
+  const configuration = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ]
+  };
+
+  // Initialize WebRTC
+  const initializeWebRTC = async () => {
+    try {
+      const pc = new RTCPeerConnection(configuration);
+      pcRef.current = pc;
+
+      // Handle incoming tracks
+      pc.ontrack = (event) => {
+        setRemoteStream(event.streams[0]);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      // Handle ICE candidates
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          handleIceCandidateFunction({
+            roomId,
+            playerId,
+            candidate: event.candidate
+          });
+        }
+      };
+
+      // Get local stream
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      stream.getTracks().forEach(track => {
+        pc.addTrack(track, stream);
+      });
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+
+      return pc;
+    } catch (error) {
+      console.error('Error initializing WebRTC:', error);
+    }
+  };
+
+  // Handle signaling
+  const handleSignaling = async (pc) => {
+    if (isHost) {
+      // Create and send offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await handleOfferFunction({
+        roomId,
+        playerId,
+        offer
+      });
+
+      // Listen for answer
+      const unsubscribe = onSnapshot(doc(db, 'rooms', roomId), async (doc) => {
+        const data = doc.data();
+        const answer = data.signaling?.answers?.[playerId];
+        if (answer && !pc.currentRemoteDescription) {
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        }
+      });
+
+      return unsubscribe;
+    } else {
+      // Listen for offer
+      const unsubscribe = onSnapshot(doc(db, 'rooms', roomId), async (doc) => {
+        const data = doc.data();
+        const offer = data.signaling?.offers?.[data.hostId];
+        if (offer && !pc.currentRemoteDescription) {
+          await pc.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await handleAnswerFunction({
+            roomId,
+            playerId,
+            answer
+          });
+        }
+      });
+
+      return unsubscribe;
+    }
+  };
+
   // Create a new game room
   const createRoom = async () => {
     try {
-      console.log('Creating new game room...');
-      const response = await fetch('http://localhost:8000/create-room', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      console.log('Attempting to create room...');
+      const result = await createRoomFunction();
+      console.log('Room creation result:', result);
+      
+      if (!result || !result.data) {
+        throw new Error('Invalid response from server');
+      }
+
+      const roomId = result.data.roomId;
+      console.log('Created room with ID:', roomId);
+      
+      const pc = await initializeWebRTC();
+      console.log('WebRTC initialized');
+      
+      setRoomId(roomId);
+      setPlayerId(roomId);
+      setIsHost(true);
+      setGameState('waiting');
+
+      // Handle signaling
+      const unsubscribe = await handleSignaling(pc);
+      console.log('Signaling setup complete');
+
+      // Listen for room updates
+      onSnapshot(doc(db, 'rooms', roomId), (doc) => {
+        const data = doc.data();
+        console.log('Room update:', data);
+        if (data.gameStarted) {
+          startGame();
+        }
+        if (data.status === 'completed') {
+          setGameResults({
+            winnerId: data.winnerId,
+            scores: data.scores
+          });
+          setGameState('results');
+          unsubscribe();
+        }
       });
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      console.log('Room created:', data);
-      
-      if (data.room_id) {
-        setRoomId(data.room_id);
-        setGameState('waiting');
-      } else {
-        throw new Error('No room_id received from server');
-      }
     } catch (error) {
       console.error('Error creating room:', error);
+      console.error('Error details:', {
+        message: error.message,
+        code: error.code,
+        details: error.details
+      });
       alert(`Failed to create game room: ${error.message}`);
     }
   };
@@ -327,16 +456,59 @@ function App() {
   // Join an existing room
   const joinRoom = async () => {
     try {
-      const response = await fetch(`http://localhost:8000/join-room/${roomId}`, {
-        method: 'POST'
+      const playerId = Math.random().toString(36).substring(2, 8).toUpperCase();
+      await joinRoomFunction({ roomId, playerId });
+      const pc = await initializeWebRTC();
+      
+      setPlayerId(playerId);
+      setGameState('waiting');
+
+      // Handle signaling
+      const unsubscribe = await handleSignaling(pc);
+
+      // Listen for game start and results
+      onSnapshot(doc(db, 'rooms', roomId), (doc) => {
+        const data = doc.data();
+        if (data.gameStarted) {
+          startGame();
+        }
+        if (data.status === 'completed') {
+          setGameResults({
+            winnerId: data.winnerId,
+            scores: data.scores
+          });
+          setGameState('results');
+          unsubscribe();
+        }
       });
-      const data = await response.json();
-      setPlayerId(data.player_id);
-      setPlayerNumber(data.player_number);
-      setGameState('playing');
-      connectWebSocket();
     } catch (error) {
       console.error('Error joining room:', error);
+      alert('Failed to join game room');
+    }
+  };
+
+  // Start the game
+  const startGame = async () => {
+    try {
+      await startGameFunction({ roomId });
+      setGameState('playing');
+      startCountdown();
+    } catch (error) {
+      console.error('Error starting game:', error);
+      alert('Failed to start game');
+    }
+  };
+
+  // Submit score
+  const submitScore = async (score) => {
+    try {
+      await submitScoreFunction({
+        roomId,
+        playerId,
+        score
+      });
+    } catch (error) {
+      console.error('Error submitting score:', error);
     }
   };
 
@@ -349,13 +521,13 @@ function App() {
       const data = JSON.parse(event.data);
       if (data.type === 'opponent_pose') {
         // Update opponent's pose overlay
-        if (opponentCanvasRef.current && opponentPoseRef.current) {
-          const canvasCtx = opponentCanvasRef.current.getContext('2d');
-          canvasCtx.clearRect(0, 0, opponentCanvasRef.current.width, opponentCanvasRef.current.height);
+        if (remoteVideoRef.current) {
+          const videoCtx = remoteVideoRef.current.getContext('2d');
+          videoCtx.clearRect(0, 0, remoteVideoRef.current.width, remoteVideoRef.current.height);
           if (data.landmarks) {
-            window.drawConnectors(canvasCtx, data.landmarks, window.POSE_CONNECTIONS,
+            window.drawConnectors(videoCtx, data.landmarks, window.POSE_CONNECTIONS,
               { color: '#0000FF', lineWidth: 2 });
-            window.drawLandmarks(canvasCtx, data.landmarks,
+            window.drawLandmarks(videoCtx, data.landmarks,
               { color: '#FF00FF', lineWidth: 1, radius: 3 });
           }
         }
@@ -381,21 +553,72 @@ function App() {
       <h1>Dance Battle App</h1>
 
       {gameState === 'lobby' && (
-        <div>
-          <button onClick={createRoom} style={buttonStyle}>
-            Create New Game
-          </button>
-          <div style={{ marginTop: '20px' }}>
-            <input
-              type="text"
-              value={roomId}
-              onChange={(e) => setRoomId(e.target.value)}
-              placeholder="Enter Room Code"
-              style={inputStyle}
-            />
-            <button onClick={joinRoom} style={buttonStyle}>
-              Join Game
+        <div style={{
+          maxWidth: '600px',
+          margin: '0 auto',
+          padding: '20px',
+          textAlign: 'center'
+        }}>
+          <h1 style={{ fontSize: '48px', marginBottom: '40px' }}>Dance Battle</h1>
+          
+          <div style={{
+            backgroundColor: '#f0f0f0',
+            padding: '30px',
+            borderRadius: '15px',
+            marginBottom: '30px'
+          }}>
+            <h2 style={{ marginBottom: '20px' }}>Create Game</h2>
+            <button 
+              onClick={createRoom}
+              style={{
+                ...buttonStyle,
+                fontSize: '24px',
+                padding: '15px 30px',
+                backgroundColor: '#4CAF50'
+              }}
+            >
+              Create New Game
             </button>
+          </div>
+
+          <div style={{
+            backgroundColor: '#f0f0f0',
+            padding: '30px',
+            borderRadius: '15px'
+          }}>
+            <h2 style={{ marginBottom: '20px' }}>Join Game</h2>
+            <div style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: '15px'
+            }}>
+              <input
+                type="text"
+                value={roomId}
+                onChange={(e) => setRoomId(e.target.value.toUpperCase())}
+                placeholder="Enter Game Code"
+                style={{
+                  ...inputStyle,
+                  fontSize: '24px',
+                  textAlign: 'center',
+                  letterSpacing: '2px',
+                  textTransform: 'uppercase'
+                }}
+                maxLength={6}
+              />
+              <button 
+                onClick={joinRoom}
+                style={{
+                  ...buttonStyle,
+                  fontSize: '24px',
+                  padding: '15px 30px',
+                  backgroundColor: '#2196F3'
+                }}
+              >
+                Join Game
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -443,24 +666,18 @@ function App() {
             </div>
           </div>
           <p>Waiting for opponent to join...</p>
-          <div style={{ display: 'flex', justifyContent: 'center', gap: '20px' }}>
-            <div style={videoContainerStyle}>
-              <h3>Reference Dance</h3>
-              <div style={{ position: 'relative' }}>
-                <video
-                  ref={referenceVideoRef}
-                  src="/justdance1.mp4"
-                  playsInline
-                  onLoadedMetadata={handleReferenceVideoLoad}
-                  style={videoStyle}
-                />
-                <canvas
-                  ref={referenceCanvasRef}
-                  style={canvasOverlayStyle}
-                />
-              </div>
-            </div>
-          </div>
+          {isHost && (
+            <button
+              onClick={() => {
+                updateDoc(doc(db, 'rooms', roomId), {
+                  gameStarted: true
+                });
+              }}
+              style={buttonStyle}
+            >
+              Start Game
+            </button>
+          )}
         </div>
       )}
 
@@ -505,9 +722,11 @@ function App() {
           <div style={videoContainerStyle}>
             <h3>Opponent's Performance</h3>
             <div style={{ position: 'relative' }}>
-              <canvas
-                ref={opponentCanvasRef}
-                style={canvasOverlayStyle}
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                style={videoStyle}
               />
             </div>
           </div>
@@ -529,20 +748,19 @@ function App() {
         }}>
           <h2>Game Results</h2>
           <div style={{ fontSize: '24px', margin: '20px 0' }}>
-            {gameResults.winner_id === playerId ? 'You Won!' : 'Opponent Won!'}
+            {gameResults.winnerId === playerId ? 'You Won!' : 'Opponent Won!'}
           </div>
           <div style={{ margin: '20px 0' }}>
             <p>Your Score: {gameResults.scores[playerId]}%</p>
-            <p>Opponent's Score: {gameResults.scores[gameResults.winner_id === playerId ? 
-              (gameResults.winner_id === gameResults.scores.player1_id ? gameResults.scores.player2_id : gameResults.scores.player1_id) 
-              : gameResults.winner_id]}%</p>
+            <p>Opponent's Score: {gameResults.scores[gameResults.winnerId === playerId ? 
+              (gameResults.winnerId === gameResults.scores.player1_id ? gameResults.scores.player2_id : gameResults.scores.player1_id) 
+              : gameResults.winnerId]}%</p>
           </div>
           <button
             onClick={() => {
               setGameState('lobby');
               setRoomId('');
               setPlayerId('');
-              setPlayerNumber(null);
               setGameResults(null);
             }}
             style={buttonStyle}
