@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from "react";
+import React, { useRef, useEffect, useState, useCallback } from "react";
 
 function App() {
   const videoRef = useRef(null);
@@ -10,6 +10,71 @@ function App() {
   const [isReferenceVideoReady, setIsReferenceVideoReady] = useState(false);
   const [isWebcamReady, setIsWebcamReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [similarityScore, setSimilarityScore] = useState(null);
+  const [referencePoses, setReferencePoses] = useState([]);
+  const [userPoses, setUserPoses] = useState([]);
+  const [isRecording, setIsRecording] = useState(false);
+
+  const onResults = useCallback((results) => {
+    if (!canvasRef.current) return;
+    
+    const canvasElement = canvasRef.current;
+    const canvasCtx = canvasElement.getContext("2d");
+
+    // Clear the canvas
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+    // Draw the video frame mirrored
+    canvasCtx.save();
+    canvasCtx.scale(-1, 1);
+    canvasCtx.drawImage(results.image, -canvasElement.width, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.restore();
+
+    if (results.poseLandmarks) {
+      // Mirror the landmarks
+      const mirroredLandmarks = results.poseLandmarks.map(landmark => ({
+        ...landmark,
+        x: 1 - landmark.x // Mirror x coordinate
+      }));
+
+      // Draw the pose landmarks
+      window.drawConnectors(canvasCtx, mirroredLandmarks, window.POSE_CONNECTIONS,
+        { color: '#00FF00', lineWidth: 2 });
+      window.drawLandmarks(canvasCtx, mirroredLandmarks,
+        { color: '#FF0000', lineWidth: 1, radius: 3 });
+
+      // Store user poses if recording
+      if (isRecording && isPlaying) {
+        setUserPoses(prev => [...prev, mirroredLandmarks]);
+      }
+    }
+  }, [isRecording, isPlaying]);
+
+  const onReferenceResults = useCallback((results) => {
+    if (!referenceCanvasRef.current) return;
+    
+    const canvasElement = referenceCanvasRef.current;
+    const canvasCtx = canvasElement.getContext("2d");
+
+    // Clear the canvas
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+    // Draw the video frame
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    if (results.poseLandmarks) {
+      // Draw the pose landmarks
+      window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS,
+        { color: '#00FF00', lineWidth: 2 });
+      window.drawLandmarks(canvasCtx, results.poseLandmarks,
+        { color: '#FF0000', lineWidth: 1, radius: 3 });
+
+      // Store reference poses if playing
+      if (isPlaying) {
+        setReferencePoses(prev => [...prev, results.poseLandmarks]);
+      }
+    }
+  }, [isPlaying]);
 
   useEffect(() => {
     // Initialize MediaPipe Pose for user video
@@ -73,47 +138,137 @@ function App() {
         referencePoseRef.current.close();
       }
     };
-  }, []);
+  }, [onResults, onReferenceResults]);
 
-  const onResults = (results) => {
-    if (!canvasRef.current) return;
+  const calculateMovementVector = (pose1, pose2) => {
+    if (!pose1 || !pose2) return null;
     
-    const canvasElement = canvasRef.current;
-    const canvasCtx = canvasElement.getContext("2d");
+    const vector = [];
+    for (let i = 0; i < pose1.length; i++) {
+      if (pose1[i] && pose2[i]) {
+        vector.push({
+          x: pose2[i].x - pose1[i].x,
+          y: pose2[i].y - pose1[i].y
+        });
+      }
+    }
+    return vector;
+  };
 
-    // Clear the canvas
-    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+  const calculateCosineSimilarity = (vec1, vec2) => {
+    if (!vec1 || !vec2 || vec1.length !== vec2.length) return 0;
 
-    // Draw the video frame
-    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+    let dotProduct = 0;
+    let magnitude1 = 0;
+    let magnitude2 = 0;
 
-    if (results.poseLandmarks) {
-      // Draw the pose landmarks
-      window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS,
-        { color: '#00FF00', lineWidth: 2 });
-      window.drawLandmarks(canvasCtx, results.poseLandmarks,
-        { color: '#FF0000', lineWidth: 1, radius: 3 });
+    // Calculate dot product and magnitudes for each landmark
+    for (let i = 0; i < vec1.length; i++) {
+      if (vec1[i] && vec2[i]) {
+        // Calculate the dot product
+        dotProduct += vec1[i].x * vec2[i].x + vec1[i].y * vec2[i].y;
+        
+        // Calculate magnitudes
+        magnitude1 += Math.sqrt(vec1[i].x * vec1[i].x + vec1[i].y * vec1[i].y);
+        magnitude2 += Math.sqrt(vec2[i].x * vec2[i].x + vec2[i].y * vec2[i].y);
+      }
+    }
+
+    // Calculate average magnitudes
+    magnitude1 = magnitude1 / vec1.length;
+    magnitude2 = magnitude2 / vec2.length;
+
+    if (magnitude1 === 0 || magnitude2 === 0) return 0;
+    
+    // Calculate the cosine similarity
+    const similarity = dotProduct / (magnitude1 * magnitude2);
+    
+    // Convert from [-1, 1] to [0, 1] and scale to make differences more noticeable
+    return Math.max(0, (similarity + 1) / 2);
+  };
+
+  const calculateSimilarity = () => {
+    if (referencePoses.length < 2 || userPoses.length < 2) return 0;
+
+    // Calculate movement vectors for both sequences
+    const refMovementVectors = [];
+    const userMovementVectors = [];
+
+    // Calculate vectors for reference video
+    for (let i = 1; i < referencePoses.length; i++) {
+      const vector = calculateMovementVector(referencePoses[i-1], referencePoses[i]);
+      if (vector) refMovementVectors.push(vector);
+    }
+
+    // Calculate vectors for user video
+    for (let i = 1; i < userPoses.length; i++) {
+      const vector = calculateMovementVector(userPoses[i-1], userPoses[i]);
+      if (vector) userMovementVectors.push(vector);
+    }
+
+    // Normalize the number of vectors to compare
+    const minLength = Math.min(refMovementVectors.length, userMovementVectors.length);
+    if (minLength === 0) return 0;
+
+    let totalSimilarity = 0;
+    let count = 0;
+
+    // Compare corresponding movement vectors
+    for (let i = 0; i < minLength; i++) {
+      const similarity = calculateCosineSimilarity(refMovementVectors[i], userMovementVectors[i]);
+      if (!isNaN(similarity)) {
+        totalSimilarity += similarity;
+        count++;
+      }
+    }
+
+    // Calculate final score with more variation
+    const averageSimilarity = count > 0 ? totalSimilarity / count : 0;
+    return averageSimilarity * 100;
+  };
+
+  const handleVideoEnd = () => {
+    setIsPlaying(false);
+    setIsRecording(false);
+    const score = calculateSimilarity();
+    setSimilarityScore(score);
+    setReferencePoses([]);
+    setUserPoses([]);
+  };
+
+  const togglePlayPause = () => {
+    if (referenceVideoRef.current) {
+      if (isPlaying) {
+        referenceVideoRef.current.pause();
+        setIsPlaying(false);
+        setIsRecording(false);
+      } else {
+        referenceVideoRef.current.play();
+        setIsPlaying(true);
+        setIsRecording(true);
+        setSimilarityScore(null);
+        setReferencePoses([]);
+        setUserPoses([]);
+      }
     }
   };
 
-  const onReferenceResults = (results) => {
-    if (!referenceCanvasRef.current) return;
-    
-    const canvasElement = referenceCanvasRef.current;
-    const canvasCtx = canvasElement.getContext("2d");
+  const restartVideo = () => {
+    if (referenceVideoRef.current) {
+      referenceVideoRef.current.currentTime = 0;
+      referenceVideoRef.current.play();
+      setIsPlaying(true);
+      setIsRecording(true);
+      // Clear all stored data
+      setSimilarityScore(null);
+      setReferencePoses([]);
+      setUserPoses([]);
+    }
+  };
 
-    // Clear the canvas
-    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-
-    // Draw the video frame
-    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
-
-    if (results.poseLandmarks) {
-      // Draw the pose landmarks
-      window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS,
-        { color: '#00FF00', lineWidth: 2 });
-      window.drawLandmarks(canvasCtx, results.poseLandmarks,
-        { color: '#FF0000', lineWidth: 1, radius: 3 });
+  const handleReferenceVideoLoad = () => {
+    if (referenceVideoRef.current) {
+      setIsReferenceVideoReady(true);
     }
   };
 
@@ -147,34 +302,21 @@ function App() {
     };
   }, [isWebcamReady, isReferenceVideoReady, isPlaying]);
 
-  const handleReferenceVideoLoad = () => {
-    if (referenceVideoRef.current) {
-      setIsReferenceVideoReady(true);
-    }
-  };
-
-  const togglePlayPause = () => {
-    if (referenceVideoRef.current) {
-      if (isPlaying) {
-        referenceVideoRef.current.pause();
-      } else {
-        referenceVideoRef.current.play();
-      }
-      setIsPlaying(!isPlaying);
-    }
-  };
-
-  const restartVideo = () => {
-    if (referenceVideoRef.current) {
-      referenceVideoRef.current.currentTime = 0;
-      referenceVideoRef.current.play();
-      setIsPlaying(true);
-    }
-  };
-
   return (
     <div className="App" style={{ textAlign: "center", padding: "20px" }}>
       <h1>Dance Battle App</h1>
+      {similarityScore !== null && (
+        <div style={{
+          fontSize: "24px",
+          margin: "20px",
+          padding: "15px",
+          backgroundColor: "#f0f0f0",
+          borderRadius: "10px",
+          display: "inline-block"
+        }}>
+          Similarity Score: {similarityScore.toFixed(2)}%
+        </div>
+      )}
       <div style={{ 
         display: "flex", 
         justifyContent: "center", 
@@ -196,6 +338,7 @@ function App() {
               src="/justdance1.mp4"
               playsInline
               onLoadedMetadata={handleReferenceVideoLoad}
+              onEnded={handleVideoEnd}
               style={{ 
                 width: "100%",
                 height: "auto",
